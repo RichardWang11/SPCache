@@ -176,6 +176,12 @@ namespace SPTAG {
             bool m_stressTest;
             int m_bufferLength;
 
+            // BufferPool 
+            size_t m_bufferPoolSize;
+            bool m_enableBufferPool;
+            std::string m_bufferPoolEvictionPolicy;
+            int m_bufferPoolHashTableExp;
+            float m_bufferPoolEvictionRatio;
 
             Options() {
 #define DefineBasicParameter(VarName, VarType, DefaultValue, RepresentStr) \
@@ -274,7 +280,6 @@ namespace SPTAG {
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
 #undef DefineSSDParameter
-
                     ;
                 }
                 return ErrorCode::Success;
@@ -329,7 +334,6 @@ namespace SPTAG {
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
 #undef DefineSSDParameter
-
                     ;
                 }
                 return std::string();

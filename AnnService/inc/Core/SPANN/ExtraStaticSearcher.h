@@ -116,6 +116,18 @@ namespace SPTAG
         class ExtraStaticSearcher : public IExtraSearcher
         {
         public:
+            struct ListInfo
+            {
+                std::size_t listTotalBytes = 0;
+                
+                int listEleCount = 0;
+
+                std::uint16_t listPageCount = 0;
+
+                std::uint64_t listOffset = 0;
+
+                std::uint16_t pageOffset = 0;
+            };
             ExtraStaticSearcher()
             {
                 m_enableDeltaEncoding = false;
@@ -126,8 +138,43 @@ namespace SPTAG
 
             virtual ~ExtraStaticSearcher()
             {
-            }
 
+            }
+                const ListInfo* GetListInfo(SizeType postingID) const 
+                {
+                    if (postingID < m_listInfos.size()) {
+                        return &m_listInfos[postingID];
+                    }
+                    return nullptr;
+                }
+
+                void ReadPostingList(SizeType postingID, char* buffer, size_t bufferSize) {
+                    ListInfo* listInfo = &m_listInfos[postingID];
+                    int fileid = m_oneContext ? 0 : postingID / m_listPerFile;
+                    m_indexFiles[fileid]->ReadBinary(bufferSize, buffer, listInfo->listOffset);
+                }
+                
+                void HelperDecompressPosting(const char* compressedData, const ListInfo* listInfo, char* decompressedBuffer) {
+                    if (listInfo->listEleCount == 0) return;
+                    m_pCompressor->Decompress(compressedData, listInfo->listTotalBytes, decompressedBuffer, listInfo->listEleCount * m_vectorInfoSize, m_enableDictTraining);
+                }
+
+                void HelperProcessPosting(char* p_postingListFullData, const ListInfo* listInfo, ExtraWorkSpace* p_exWorkSpace, COMMON::QueryResultSet<ValueType>& queryResults, std::shared_ptr<VectorIndex>& p_index) 
+                {
+                    for (int i = 0; i < listInfo->listEleCount; i++) 
+                    {
+                        uint64_t offsetVectorID, offsetVector;
+                        (this->*m_parsePosting)(offsetVectorID, offsetVector, i, listInfo->listEleCount);
+                        int vectorID = *(reinterpret_cast<int*>(p_postingListFullData + offsetVectorID));
+                        if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue;
+                        
+                        ValueType* vectorData = (ValueType*)(p_postingListFullData + offsetVector);
+                        (this->*m_parseEncoding)(p_index, const_cast<ListInfo*>(listInfo), vectorData);
+                        
+                        auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), vectorData);
+                        queryResults.AddPoint(vectorID, distance2leaf);
+                    }
+                }
             virtual bool LoadIndex(Options& p_opt, COMMON::VersionLabel& p_versionMap) {
                 m_extraFullGraphFile = p_opt.m_indexDirectory + FolderSep + p_opt.m_ssdIndex;
                 std::string curFile = m_extraFullGraphFile;
@@ -193,6 +240,7 @@ namespace SPTAG
                 SearchStats* p_stats,
                 std::set<int>* truth, std::map<int, std::set<int>>* found)
             {
+                this->p_index = p_index;
                 const uint32_t postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
 
                 COMMON::QueryResultSet<ValueType>& queryResults = *((COMMON::QueryResultSet<ValueType>*)&p_queryResults);
@@ -260,19 +308,19 @@ namespace SPTAG
                     }
 #endif
 #else // sync read
-                    auto numRead = indexFile->ReadBinary(totalBytes, buffer, listInfo->listOffset);
-                    if (numRead != totalBytes) {
-                        LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, acutal: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
-                        throw std::runtime_error("File read mismatch");
-                    }
-                    // decompress posting list
-                    char* p_postingListFullData = buffer + listInfo->pageOffset;
-                    if (m_enableDataCompression)
-                    {
-                        DecompressPosting();
-                    }
-
-                    ProcessPosting();
+                auto numRead = indexFile->ReadBinary(totalBytes, buffer, listInfo->listOffset);
+                if (numRead!= totalBytes) {
+                    LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, actual: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
+                    throw std::runtime_error("File read mismatch");
+                }
+                
+                // Process the data that was just read
+                char* p_postingListFullData = buffer + listInfo->pageOffset;
+                if (m_enableDataCompression)
+                {
+                    DecompressPosting();
+                }
+                ProcessPosting();
 #endif
                 }
 
@@ -749,19 +797,6 @@ namespace SPTAG
             }
 
         private:
-            struct ListInfo
-            {
-                std::size_t listTotalBytes = 0;
-                
-                int listEleCount = 0;
-
-                std::uint16_t listPageCount = 0;
-
-                std::uint64_t listOffset = 0;
-
-                std::uint16_t pageOffset = 0;
-            };
-
             int LoadingHeadInfo(const std::string& p_file, int p_postingPageLimit, std::vector<ListInfo>& m_listInfos)
             {
                 auto ptr = SPTAG::f_createIO();
@@ -1289,25 +1324,71 @@ namespace SPTAG
                 LOG(Helper::LogLevel::LL_Info, "Time to write results:%.2lf sec.\n", ((double)std::chrono::duration_cast<std::chrono::seconds>(t2 - t1).count()) + ((double)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()) / 1000);
             }
 
-            void GetWritePosting(SizeType pid, std::string& posting, bool write = false) override {
+            void GetWritePosting(SizeType pid, std::string& posting, bool write = false) override 
+            {
                 if (write) {
-                    LOG(Helper::LogLevel::LL_Error, "Unsupport write\n");
-                    exit(1);
+                    throw std::runtime_error("Write operation not supported");
                 }
                 ListInfo* listInfo = &(m_listInfos[pid]);
                 size_t totalBytes = (static_cast<size_t>(listInfo->listPageCount) << PageSizeEx);
                 size_t realBytes = listInfo->listEleCount * m_vectorInfoSize;
-                posting.resize(totalBytes);
-                int fileid = m_oneContext? 0: pid / m_listPerFile;
-                Helper::DiskIO* indexFile = m_indexFiles[fileid].get();
-                auto numRead = indexFile->ReadBinary(totalBytes, posting.data(), listInfo->listOffset);
-                if (numRead != totalBytes) {
-                    LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, acutal: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
-                    throw std::runtime_error("File read mismatch");
+                // posting.resize(totalBytes);
+                // int fileid = m_oneContext? 0: pid / m_listPerFile;
+                // Helper::DiskIO* indexFile = m_indexFiles[fileid].get();
+                // auto numRead = indexFile->ReadBinary(totalBytes, posting.data(), listInfo->listOffset);
+                // if (numRead != totalBytes) {
+                //     LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, acutal: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
+                //     throw std::runtime_error("File read mismatch");
+                // }
+                // char* ptr = (char*)(posting.c_str());
+                // memcpy(ptr, posting.c_str() + listInfo->pageOffset, realBytes);
+                // posting.resize(realBytes);
+                // 检查是否可以从缓冲池获取数据
+                 // 检查是否可以从缓冲池获取数据
+                bool cacheHit = false;
+                auto* spannIndex = dynamic_cast<SPANN::Index<ValueType>*>(p_index.get());
+                if (spannIndex && spannIndex->IsBufferPoolEnabled()) {
+                    size_t cachedSize = 0;
+                    void* cachedData = spannIndex->GetFromBufferPool(pid, cachedSize);
+                    
+                    if (cachedData && cachedSize >= totalBytes) {
+                        // 缓存命中，直接使用缓存数据
+                        posting.resize(realBytes);
+                        char* ptr = (char*)(posting.data());
+                        memcpy(ptr, static_cast<char*>(cachedData) + listInfo->pageOffset, realBytes);
+                        cacheHit = true;
+                        LOG(Helper::LogLevel::LL_Debug, "Buffer pool hit for posting list %d in GetWritePosting\n", pid);
+                    }
                 }
-                char* ptr = (char*)(posting.c_str());
-                memcpy(ptr, posting.c_str() + listInfo->pageOffset, realBytes);
-                posting.resize(realBytes);
+                
+                // 如果缓冲池未命中，则从磁盘读取
+                if (!cacheHit) {
+                    posting.resize(totalBytes);
+                    int fileid = m_oneContext ? 0 : pid / m_listPerFile;
+                    Helper::DiskIO* indexFile = m_indexFiles[fileid].get();
+                    
+                    auto numRead = indexFile->ReadBinary(totalBytes, posting.data(), listInfo->listOffset);
+                    if (numRead != totalBytes) {
+                        LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, actual: %llu.\n", 
+                            m_extraFullGraphFile.c_str(), totalBytes, numRead);
+                        throw std::runtime_error("File read mismatch");
+                    }
+                    
+                    // 将数据放入缓冲池
+                    if (spannIndex && spannIndex->IsBufferPoolEnabled()) {
+                        void* copyData = malloc(totalBytes);
+                        if (copyData) {
+                            memcpy(copyData, posting.data(), totalBytes);
+                            spannIndex->PutToBufferPool(pid, copyData, totalBytes);
+                            LOG(Helper::LogLevel::LL_Debug, "Added posting list %d to buffer pool in GetWritePosting\n", pid);
+                        }
+                    }
+                    
+                    // 调整数据大小
+                    char* ptr = (char*)(posting.data());
+                    memcpy(ptr, posting.data() + listInfo->pageOffset, realBytes);
+                    posting.resize(realBytes);
+                }
             }
 
         private:
@@ -1323,7 +1404,7 @@ namespace SPTAG
             bool m_enablePostingListRearrange;
             bool m_enableDataCompression;
             bool m_enableDictTraining;
-
+            std::shared_ptr<VectorIndex> p_index;
             void (ExtraStaticSearcher<ValueType>::*m_parsePosting)(uint64_t&, uint64_t&, int, int);
             void (ExtraStaticSearcher<ValueType>::*m_parseEncoding)(std::shared_ptr<VectorIndex>&, ListInfo*, ValueType*);
 

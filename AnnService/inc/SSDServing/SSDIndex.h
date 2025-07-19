@@ -183,6 +183,25 @@ namespace SPTAG {
                 int K = p_opts.m_resultNum;
                 int truthK = (p_opts.m_truthResultNum <= 0) ? K : p_opts.m_truthResultNum;
 
+                // <<-- 修正：使用正确的 RAII 自动恢复机制 -->>
+            bool original_direct_io_setting = p_opts.m_useDirectIO;
+            LOG(Helper::LogLevel::LL_Debug, "Original UseDirectIO setting: %s\n", 
+                original_direct_io_setting ? "true" : "false");
+
+            // 使用一个简单的 RAII 类来确保自动恢复
+            struct DirectIORestorer {
+                SPANN::Options& opts;
+                bool original_setting;
+                
+                DirectIORestorer(SPANN::Options& o, bool orig) : opts(o), original_setting(orig) {}
+                
+                ~DirectIORestorer() {
+                    opts.m_useDirectIO = original_setting;
+                    LOG(Helper::LogLevel::LL_Debug, "Restored UseDirectIO setting to: %s\n", 
+                        original_setting ? "true" : "false");
+                }
+            } setting_guard(p_opts, original_direct_io_setting);
+
                 if (!warmupFile.empty())
                 {
                     LOG(Helper::LogLevel::LL_Info, "Start loading warmup query set...\n");
@@ -268,6 +287,9 @@ namespace SPTAG {
                 std::vector<std::set<SizeType>> truth;
                 if (!truthFile.empty())
                 {
+                    // <<-- 关键修改：在加载 TruthFile 前临时禁用 DirectIO -->>
+                    LOG(Helper::LogLevel::LL_Info, "Temporarily disabling DirectIO for TruthFile loading...\n");
+                    p_opts.m_useDirectIO = false;
                     LOG(Helper::LogLevel::LL_Info, "Start loading TruthFile...\n");
 
                     auto ptr = f_createIO();
@@ -281,7 +303,8 @@ namespace SPTAG {
                     if (ptr->ReadBinary(4, tmp) == 4) {
                         LOG(Helper::LogLevel::LL_Error, "Truth number is larger than query number(%d)!\n", numQueries);
                     }
-
+                    LOG(Helper::LogLevel::LL_Info, "TruthFile loaded successfully.\n");
+     
                     recall = COMMON::TruthSet::CalculateRecall<ValueType>((p_index->GetMemoryIndex()).get(), results, truth, K, truthK, querySet, vectorSet, numQueries, nullptr, false, &MRR);
                     LOG(Helper::LogLevel::LL_Info, "Recall%d@%d: %f MRR@%d: %f\n", truthK, K, recall, K, MRR);
                 }

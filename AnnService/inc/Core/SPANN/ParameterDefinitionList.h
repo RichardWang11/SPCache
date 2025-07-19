@@ -126,7 +126,11 @@ DefineSSDParameter(m_enableADC, bool, false, "EnableADC")
 DefineSSDParameter(m_recall_analysis, bool, false, "RecallAnalysis")
 DefineSSDParameter(m_debugBuildInternalResultNum, int, 64, "DebugBuildInternalResultNum")
 DefineSSDParameter(m_iotimeout, int, 30, "IOTimeout")
-
+DefineSSDParameter(m_enableBufferPool, bool, false, "EnableBufferPool")
+DefineSSDParameter(m_bufferPoolSize, size_t, 536870912, "BufferPoolSize")
+DefineSSDParameter(m_bufferPoolEvictionPolicy, std::string, "LRU", "BufferPoolEvictionPolicy")
+DefineSSDParameter(m_bufferPoolHashTableExp, int, 16, "BufferPoolHashTableExp")
+DefineSSDParameter(m_bufferPoolEvictionRatio, float, 0.1f, "BufferPoolEvictionRatio")
 // Calculating
 // TruthFilePrefix
 DefineSSDParameter(m_truthFilePrefix, std::string, std::string(""), "TruthFilePrefix")

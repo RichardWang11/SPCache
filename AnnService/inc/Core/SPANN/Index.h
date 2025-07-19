@@ -24,6 +24,7 @@
 
 #include "IExtraSearcher.h"
 #include "Options.h"
+#include "SPANNBufferPool.h"
 
 #include <functional>
 #include <shared_mutex>
@@ -55,18 +56,53 @@ namespace SPTAG
 
             std::mutex m_dataAddLock;
             COMMON::VersionLabel m_versionMap;
-
+            // buffer pool member
+            mutable std::unique_ptr<SPANNBufferPool> m_bufferPool;
+            bool m_enableBufferPool;
+            
+        // public:
+        //     static thread_local std::shared_ptr<ExtraWorkSpace> m_workspace;
         public:
-            static thread_local std::shared_ptr<ExtraWorkSpace> m_workspace;
-
-        public:
-            Index()
-            {
-                m_fComputeDistance = std::function<float(const T*, const T*, DimensionType)>(COMMON::DistanceCalcSelector<T>(m_options.m_distCalcMethod));
-                m_iBaseSquare = (m_options.m_distCalcMethod == DistCalcMethod::Cosine) ? COMMON::Utils::GetBase<T>() * COMMON::Utils::GetBase<T>() : 1;
+    // 使用更安全的 thread_local 管理方式
+            static std::shared_ptr<ExtraWorkSpace>& GetWorkspaceInstance() {
+            static thread_local std::shared_ptr<ExtraWorkSpace> workspace;
+            return workspace;
+        }
+        // 获取工作空间的安全方法
+        std::shared_ptr<ExtraWorkSpace> GetWorkspace() const {
+            auto& workspace = GetWorkspaceInstance();
+            if (!workspace) {
+                workspace = std::make_shared<ExtraWorkSpace>();
+                workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, 
+                                    m_options.m_searchInternalResultNum, 
+                                    min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, 
+                                    m_options.m_enableDataCompression);
             }
+            return workspace;
+        }
 
-            ~Index() {}
+        // 清理工作空间
+        static void ClearWorkspace() {
+            try {
+                auto& workspace = GetWorkspaceInstance();
+                if (workspace) {
+                    workspace.reset();
+                }
+            } catch (...) {
+                // 忽略清理错误
+            }
+        }
+
+        // 添加析构状态管理
+        mutable std::atomic<bool> m_destructorCalled{false};
+        public:
+             Index(): m_enableBufferPool(false), m_destructorCalled(false)
+                {
+                    m_fComputeDistance = std::function<float(const T*, const T*, DimensionType)>(COMMON::DistanceCalcSelector<T>(m_options.m_distCalcMethod));
+                    m_iBaseSquare = (m_options.m_distCalcMethod == DistCalcMethod::Cosine) ? COMMON::Utils::GetBase<T>() * COMMON::Utils::GetBase<T>() : 1;
+                }
+// update
+            ~Index();
 
             inline std::shared_ptr<VectorIndex> GetMemoryIndex() { return m_index; }
             inline std::shared_ptr<IExtraSearcher> GetDiskIndex() { return m_extraSearcher; }
@@ -156,6 +192,8 @@ namespace SPTAG
 
             ErrorCode BuildIndexInternal(std::shared_ptr<Helper::VectorSetReader>& p_reader);
 
+            void InitBufferPool(size_t maxSizeBytes);
+
         public:
             bool AllFinished() { if (m_options.m_useKV || m_options.m_useSPDK) return m_extraSearcher->AllFinished(); return true; }
 
@@ -220,6 +258,59 @@ namespace SPTAG
 
                 return m_extraSearcher->AddIndex(vectorSet, m_index, begin);
             }
+            // 添加缓冲池相关方法
+           
+            void* GetFromBufferPool(int64_t listID, size_t& size) const {
+            if (m_bufferPool && m_enableBufferPool) {
+                return m_bufferPool->get(listID, size);
+                }
+                return nullptr;
+            }
+    
+            void PutToBufferPool(int64_t listID, void* data, size_t size) const {
+                if (m_bufferPool && m_enableBufferPool) {
+                    m_bufferPool->put(listID, data, size);
+                }
+            }
+            bool IsBufferPoolEnabled() const { 
+                return m_enableBufferPool && m_bufferPool != nullptr; 
+            }
+            
+            float GetBufferPoolHitRatio() const {
+                return (m_bufferPool && m_enableBufferPool) ? m_bufferPool->getHitRatio() : 0.0f;
+            }
+            
+            void ResetBufferPoolStats() {
+                if (m_bufferPool && m_enableBufferPool) {
+                    m_bufferPool->resetStats();
+                }
+            }
+            
+            size_t GetBufferPoolCurrentSize() const {
+                return (m_bufferPool && m_enableBufferPool) ? m_bufferPool->getCurrentSize() : 0;
+            }
+            
+            // 获取缓存的Posting List（供内部使用）
+            void* GetCachedPostingList(int64_t listID, size_t& size) const {
+                return GetFromBufferPool(listID, size);
+            }
+            
+            void CachePostingList(int64_t listID, void* data, size_t size) const {
+                PutToBufferPool(listID, data, size);
+            }
+            
+            // 预取相关Posting Lists
+            void PrefetchPostingLists(const std::vector<int64_t>& listIDs) const{
+                if (m_bufferPool && m_enableBufferPool) {
+                    m_bufferPool->prefetch(listIDs);
+                }
+            }
+
+            // SearchIndexWithBufferPool 方法声明
+            void SearchIndexWithBufferPool(ExtraWorkSpace* workspace,
+                                         COMMON::QueryResultSet<T>& queryResults,
+                                         std::shared_ptr<VectorIndex> headIndex,
+                                         SearchStats* stats) const;
         };
     } // namespace SPANN
 } // namespace SPTAG

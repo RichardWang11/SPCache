@@ -8,19 +8,44 @@
 #include <shared_mutex>
 #include <chrono>
 #include <random>
-
+#include "inc/Core/SPANN/SPANNBufferPool.h"
 #pragma warning(disable:4242)  // '=' : conversion from 'int' to 'short', possible loss of data
 #pragma warning(disable:4244)  // '=' : conversion from 'int' to 'short', possible loss of data
 #pragma warning(disable:4127)  // conditional expression is constant
-
+#include <signal.h>
+#include <execinfo.h>
+#include <cstdlib>
+#include <unistd.h>
+// namespace {
+//     void segfault_handler(int sig) {
+//         void *array[10];
+//         size_t size;
+        
+//         // 获取调用栈
+//         size = backtrace(array, 10);
+        
+//         // 打印调用栈到 stderr
+//         fprintf(stderr, "Error: signal %d in AVX distance calculation:\n", sig);
+//         backtrace_symbols_fd(array, size, STDERR_FILENO);
+        
+//         // 直接退出，不进行进一步清理
+//         _exit(1);
+//     }
+    
+//     // 注册信号处理程序
+//     static bool signal_handler_registered = []() {
+//         signal(SIGSEGV, segfault_handler);
+//         return true;
+//     }();
+// }
 namespace SPTAG
 {
     namespace SPANN
     {
         std::atomic_int ExtraWorkSpace::g_spaceCount(0);
         EdgeCompare Selection::g_edgeComparer;
-        template <typename T>
-        thread_local std::shared_ptr<ExtraWorkSpace> Index<T>::m_workspace;
+        // template <typename T>
+        // thread_local std::shared_ptr<ExtraWorkSpace> Index<T>::m_workspace;
 
         std::function<std::shared_ptr<Helper::DiskIO>(void)> f_createAsyncIO = []() -> std::shared_ptr<Helper::DiskIO> { return std::shared_ptr<Helper::DiskIO>(new Helper::AsyncFileIO()); };
 
@@ -56,7 +81,19 @@ namespace SPTAG
                 m_index->SetQuantizer(quantizer);
             }
         }
-
+        // 初始化bufferpool实现
+        template <typename T>
+        void Index<T>::InitBufferPool(size_t bufferSize) {
+            try {
+                m_bufferPool = std::make_unique<SPANNBufferPool>(bufferSize);
+                m_enableBufferPool = true;
+                LOG(Helper::LogLevel::LL_Info, "SPANN Buffer Pool initialized with size: %zu bytes\n", bufferSize);
+            } catch (const std::exception& e) {
+                LOG(Helper::LogLevel::LL_Error, "Failed to initialize buffer pool: %s\n", e.what());
+                m_enableBufferPool = false;
+                m_bufferPool.reset();
+            }
+        }
         template <typename T>
         ErrorCode Index<T>::LoadConfig(Helper::IniReader& p_reader)
         {
@@ -64,8 +101,8 @@ namespace SPTAG
             VectorValueType valueType = p_reader.GetParameter("Base", "ValueType", VectorValueType::Undefined);
             if ((m_index = CreateInstance(algoType, valueType)) == nullptr) return ErrorCode::FailedParseValue;
 
-            std::string sections[] = { "Base", "SelectHead", "BuildHead", "BuildSSDIndex" };
-            for (int i = 0; i < 4; i++) {
+            std::string sections[] = { "Base", "SelectHead", "BuildHead", "BuildSSDIndex", "SearchSSDIndex" };
+            for (int i = 0; i < 5; i++) {
                 auto parameters = p_reader.GetParameters(sections[i].c_str());
                 for (auto iter = parameters.begin(); iter != parameters.end(); iter++) {
                     SetParameter(iter->first.c_str(), iter->second.c_str(), sections[i].c_str());
@@ -76,7 +113,16 @@ namespace SPTAG
             {
                 m_pQuantizer->SetEnableADC(m_options.m_enableADC);
             }
+    // 添加调试日志
+            // LOG(Helper::LogLevel::LL_Info, "EnableBufferPool: %s\n", 
+            //     m_options.m_enableBufferPool ? "true" : "false");
+            // LOG(Helper::LogLevel::LL_Info, "BufferPoolSize: %zu\n", 
+            //     m_options.m_bufferPoolSize);
 
+            // if (m_options.m_enableBufferPool && m_options.m_bufferPoolSize > 0) {
+            //     InitBufferPool(m_options.m_bufferPoolSize);
+            //     LOG(Helper::LogLevel::LL_Info, "Buffer pool enabled with size: %zu bytes\n", m_options.m_bufferPoolSize);
+            // }
             return ErrorCode::Success;
         }
 
@@ -116,6 +162,11 @@ namespace SPTAG
             if (m_options.m_excludehead) m_vectorTranslateMap.reset((std::uint64_t*)(p_indexBlobs.back().Data()), [=](std::uint64_t* ptr) {});
 
             omp_set_num_threads(m_options.m_iSSDNumberOfThreads);
+            // 在加载完成后初始化缓冲池
+            if (m_options.m_enableBufferPool && m_options.m_bufferPoolSize > 0) {
+                InitBufferPool(m_options.m_bufferPoolSize);
+                LOG(Helper::LogLevel::LL_Info, "Buffer pool initialized after loading index from memory\n");
+            }
             return ErrorCode::Success;
         }
 
@@ -256,6 +307,11 @@ namespace SPTAG
                 m_extraSearcher->RefineIndex(vectorReader, m_index);
             }
 
+            // 在索引加载完成后初始化缓冲池
+            if (m_options.m_enableBufferPool && m_options.m_bufferPoolSize > 0) {
+                InitBufferPool(m_options.m_bufferPoolSize);
+                LOG(Helper::LogLevel::LL_Info, "Buffer pool initialized after loading index from disk\n");
+            }
             return ErrorCode::Success;
         }
 
@@ -325,15 +381,20 @@ namespace SPTAG
 
             m_index->SearchIndex(*p_queryResults);
 
-            if (m_extraSearcher != nullptr) {
-                if (m_workspace.get() == nullptr) {
-                    m_workspace.reset(new ExtraWorkSpace());
-                    m_workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, m_options.m_enableDataCompression);
-                }
-                m_workspace->m_deduper.clear();
-                m_workspace->m_postingIDs.clear();
-
+            // if (m_extraSearcher != nullptr) {
+            //     if (m_workspace.get() == nullptr) {
+            //         m_workspace.reset(new ExtraWorkSpace());
+            //         m_workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, m_options.m_enableDataCompression);
+            //     }
+            //     m_workspace->m_deduper.clear();
+            //     m_workspace->m_postingIDs.clear();
+            auto workspace = GetWorkspace();
+            if (workspace != nullptr) {
+                workspace->m_deduper.clear();
+                workspace->m_postingIDs.clear();
                 float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
+                 // 收集候选 Posting List IDs，准备预取
+                std::vector<int64_t> candidatePostingIDs;
                 for (int i = 0; i < p_queryResults->GetResultNum(); ++i)
                 {
                     auto res = p_queryResults->GetResult(i);
@@ -347,16 +408,39 @@ namespace SPTAG
                     }
 
                     // Don't do disk reads for irrelevant pages
-                    if (m_workspace->m_postingIDs.size() >= m_options.m_searchInternalResultNum ||
+                    if (workspace->m_postingIDs.size() >= m_options.m_searchInternalResultNum ||
                         (limitDist > 0.1 && res->Dist > limitDist) ||
                         !m_extraSearcher->CheckValidPosting(postingID))
                         continue;
-                    m_workspace->m_postingIDs.emplace_back(postingID);
+                    workspace->m_postingIDs.emplace_back(postingID);
+                    candidatePostingIDs.emplace_back(postingID);
                 }
+                // 如果启用了缓冲池，进行预取
+                // if (IsBufferPoolEnabled() && !candidatePostingIDs.empty()) {
+                //     const_cast<Index<T>*>(this)->PrefetchPostingLists(candidatePostingIDs);
+                //     LOG(Helper::LogLevel::LL_Debug, "Prefetched %zu posting lists for buffer pool\n", candidatePostingIDs.size());
+                // }
 
                 if (m_vectorTranslateMap.get() != nullptr) p_queryResults->Reverse();
-                m_extraSearcher->SearchIndex(m_workspace.get(), *p_queryResults, m_index, nullptr);
+
+                 // 使用增强的搜索器，支持缓冲池
+                if (IsBufferPoolEnabled()) {
+                    // 这里可以将缓冲池接口传递给 ExtraSearcher
+                    // 需要修改 ExtraSearcher 接口支持缓冲池
+                    this->SearchIndexWithBufferPool(workspace.get(), *p_queryResults, m_index, nullptr);
+                } else {
+                    m_extraSearcher->SearchIndex(workspace.get(), *p_queryResults, m_index, nullptr);
+                }
                 p_queryResults->SortResult();
+
+                // 记录缓冲池统计信息
+                if (IsBufferPoolEnabled()) {
+                    static int searchCount = 0;
+                    if (++searchCount % 5000 == 0) {  // 每5000次搜索记录一次统计
+                        LOG(Helper::LogLevel::LL_Info, "Buffer pool hit ratio: %.4f, current size: %zu bytes\n", 
+                            GetBufferPoolHitRatio(), GetBufferPoolCurrentSize());
+                    }
+                }
             }
 
             if (p_query.GetResultNum() < m_options.m_searchInternalResultNum) {
@@ -381,44 +465,74 @@ namespace SPTAG
             if (nullptr == m_extraSearcher) return ErrorCode::EmptyIndex;
 
             COMMON::QueryResultSet<T>* p_queryResults = (COMMON::QueryResultSet<T>*) & p_query;
-
-            if (m_workspace.get() == nullptr) {
-                m_workspace.reset(new ExtraWorkSpace());
-                m_workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, m_options.m_enableDataCompression);
+            auto workspace = GetWorkspace();
+            // if (workspace.get() == nullptr) {
+            //     workspace.reset(new ExtraWorkSpace());
+            //     workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, 
+            //                         min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, 
+            //                         m_options.m_enableDataCompression);
+            // }
+            if (workspace == nullptr) {
+                LOG(Helper::LogLevel::LL_Error, "Failed to get workspace\n");
+                return ErrorCode::Fail;
             }
-            m_workspace->m_deduper.clear();
-            m_workspace->m_postingIDs.clear();
+            workspace->m_deduper.clear();
+            workspace->m_postingIDs.clear();
 
+            // 收集候选 Posting List IDs
+            // std::vector<int64_t> candidatePostingIDs;
             float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
             int i = 0;
             for (; i < p_queryResults->GetResultNum(); ++i)
             {
                 auto res = p_queryResults->GetResult(i);
                 if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist)) break;
+                
                 if (m_extraSearcher->CheckValidPosting(res->VID))
                 {
-                    m_workspace->m_postingIDs.emplace_back(res->VID);
+                    workspace->m_postingIDs.emplace_back(res->VID);
+                    // // 添加到候选ID列表中，用于预取
+                    // candidatePostingIDs.push_back(static_cast<int64_t>(res->VID));
                 }
-                if (m_vectorTranslateMap.get() != nullptr) res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                
+                if (m_vectorTranslateMap.get() != nullptr) 
+                    res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
                 else {
                     res->VID = -1;
                     res->Dist = MaxDist;
                 }
             }
 
+            // 预取候选 Posting Lists
+            // if (IsBufferPoolEnabled() && !candidatePostingIDs.empty()) {
+            //     LOG(Helper::LogLevel::LL_Debug, "Prefetching %zu posting lists\n", candidatePostingIDs.size());
+            //     const_cast<Index<T>*>(this)->PrefetchPostingLists(candidatePostingIDs);
+            // }
+            
             for (; i < p_queryResults->GetResultNum(); ++i)
             {
                 auto res = p_queryResults->GetResult(i);
                 if (res->VID == -1) break;
-                if (m_vectorTranslateMap.get() != nullptr)  res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                
+                if (m_vectorTranslateMap.get() != nullptr)  
+                    res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
                 else {
                     res->VID = -1;
                     res->Dist = MaxDist;
                 }
             }
-            if (m_vectorTranslateMap.get() != nullptr) p_queryResults->Reverse();
-            m_extraSearcher->SearchIndex(m_workspace.get(), *p_queryResults, m_index, p_stats);
+            
+            if (m_vectorTranslateMap.get() != nullptr) 
+                p_queryResults->Reverse();
+            
+    
+            if (IsBufferPoolEnabled()) {
+                this->SearchIndexWithBufferPool(workspace.get(), *p_queryResults, m_index, p_stats);
+            } else {
+                m_extraSearcher->SearchIndex(workspace.get(), *p_queryResults, m_index, p_stats);
+            }
             p_queryResults->SortResult();
+            
             return ErrorCode::Success;
         }
 
@@ -446,28 +560,34 @@ namespace SPTAG
                 newResults.reset(new COMMON::QueryResultSet<T>((T*)p_query.GetTarget(), p_query.GetResultNum()));
             }
 
-            if (m_workspace.get() == nullptr) {
-                m_workspace.reset(new ExtraWorkSpace());
-                m_workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, m_options.m_enableDataCompression);
+            // if (workspace.get() == nullptr) {
+            //     workspace.reset(new ExtraWorkSpace());
+            //     workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, m_options.m_enableDataCompression);
+            // }
+            // 修改这里：使用 GetWorkspace() 方法
+            auto workspace = GetWorkspace();
+            if (workspace == nullptr) {
+                LOG(Helper::LogLevel::LL_Error, "Failed to get workspace\n");
+                return ErrorCode::Fail;
             }
-            m_workspace->m_deduper.clear();
+            workspace->m_deduper.clear();
 
             int partitions = (p_internalResultNum + p_subInternalResultNum - 1) / p_subInternalResultNum;
             float limitDist = p_query.GetResult(0)->Dist * m_options.m_maxDistRatio;
             for (SizeType p = 0; p < partitions; p++) {
                 int subInternalResultNum = min(p_subInternalResultNum, p_internalResultNum - p_subInternalResultNum * p);
 
-                m_workspace->m_postingIDs.clear();
+                workspace->m_postingIDs.clear();
 
                 for (int i = p * p_subInternalResultNum; i < p * p_subInternalResultNum + subInternalResultNum; i++)
                 {
                     auto res = p_query.GetResult(i);
                     if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist)) break;
                     if (!m_extraSearcher->CheckValidPosting(res->VID)) continue;
-                    m_workspace->m_postingIDs.emplace_back(res->VID);
+                    workspace->m_postingIDs.emplace_back(res->VID);
                 }
 
-                m_extraSearcher->SearchIndex(m_workspace.get(), *newResults, m_index, p_stats, truth, found);
+                m_extraSearcher->SearchIndex(workspace.get(), *newResults, m_index, p_stats, truth, found);
             }
 
             newResults->SortResult();
@@ -991,6 +1111,131 @@ namespace SPTAG
             return ErrorCode::Success;
         }
 
+         // 添加带缓冲池的搜索方法
+        template <typename T>
+        void Index<T>::SearchIndexWithBufferPool(ExtraWorkSpace* workspace, 
+                                                COMMON::QueryResultSet<T>& queryResults, 
+                                                std::shared_ptr<VectorIndex> headIndex, 
+                                                SearchStats* stats) const
+        {
+            
+            auto* extraSearcher = dynamic_cast<ExtraStaticSearcher<T>*>(m_extraSearcher.get());
+            if (!extraSearcher) {
+                // 如果不是静态搜索器，则回退到原始方法
+                m_extraSearcher->SearchIndex(workspace, queryResults, headIndex, stats);
+                return;
+            }
+            const uint32_t postingListCount = static_cast<uint32_t>(workspace->m_postingIDs.size());
+            int diskRead = 0;
+            int diskIO = 0;
+            int listElements = 0;
+            
+            for (uint32_t pi = 0; pi < postingListCount; ++pi) {
+                auto curPostingID = workspace->m_postingIDs[pi];
+                if (!extraSearcher->CheckValidPosting(curPostingID)) {
+                    LOG(Helper::LogLevel::LL_Debug, "Skipping invalid posting list %d\n", curPostingID);
+                    continue;
+                }
+
+            auto listInfo = extraSearcher->GetListInfo(curPostingID);
+            if (!listInfo) {
+                LOG(Helper::LogLevel::LL_Debug, "No list info for posting list %d\n", curPostingID);
+                continue;
+            }
+
+            // 检查是否应该跳过这个posting list
+            if (listInfo->listEleCount == 0) {
+                LOG(Helper::LogLevel::LL_Debug, "Empty posting list %d\n", curPostingID);
+                continue;
+            }
+                listElements += listInfo->listEleCount;
+                char* p_postingListFullData = nullptr;
+                std::vector<char> disk_buffer; // 用于缓存未命中时从磁盘读取
+                bool usedCache = false; 
+        // 1. 尝试从缓冲池获取数据
+                size_t cachedSize = 0;
+                void* cachedData = m_bufferPool->get(curPostingID, cachedSize);
+
+                if (cachedData) {
+                    // 缓存命中 - 验证数据完整性
+                    size_t expectedSize = (static_cast<size_t>(listInfo->listPageCount) << PageSizeEx);
+                    if (cachedSize >= expectedSize) {
+                        p_postingListFullData = reinterpret_cast<char*>(cachedData);
+                        usedCache = true;
+                        LOG(Helper::LogLevel::LL_Debug, "Cache hit for posting list %d, size: %zu\n", 
+                            curPostingID, cachedSize);
+                    } else {
+                        LOG(Helper::LogLevel::LL_Warning, 
+                            "Cached data size mismatch for posting list %d: cached=%zu, expected=%zu\n", 
+                            curPostingID, cachedSize, expectedSize);
+                    }
+                }
+                
+                if (!usedCache) {
+                    // 缓存未命中或数据不完整，从磁盘读取
+                    diskIO++;
+                    diskRead += listInfo->listPageCount;
+                    size_t totalBytes = (static_cast<size_t>(listInfo->listPageCount) << PageSizeEx);
+                    disk_buffer.resize(totalBytes);
+                    
+                    try {
+                        extraSearcher->ReadPostingList(curPostingID, disk_buffer.data(), totalBytes);
+                        
+                        // 将新读取的数据放入缓冲池
+                        void* copyForCache = malloc(totalBytes);
+                        if (copyForCache) {
+                            memcpy(copyForCache, disk_buffer.data(), totalBytes);
+                            m_bufferPool->put(curPostingID, copyForCache, totalBytes);
+                            LOG(Helper::LogLevel::LL_Debug, "Added posting list %d to cache, size: %zu\n", 
+                                curPostingID, totalBytes);
+                        } else {
+                            LOG(Helper::LogLevel::LL_Error, "Failed to allocate memory for cache\n");
+                        }
+                        p_postingListFullData = disk_buffer.data();
+                    } catch (const std::exception& e) {
+                        LOG(Helper::LogLevel::LL_Error, "Failed to read posting list %d: %s\n", 
+                            curPostingID, e.what());
+                        continue;
+                    }
+                }
+
+                // 2. 处理数据压缩
+            char* processedData = nullptr;
+            if (m_options.m_enableDataCompression) {
+                char* decompressedBuffer = (char*)workspace->m_decompressBuffer.GetBuffer();
+                try {
+                    extraSearcher->HelperDecompressPosting(
+                        p_postingListFullData + listInfo->pageOffset, 
+                        listInfo, 
+                        decompressedBuffer
+                    );
+                    processedData = decompressedBuffer;
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Failed to decompress posting list %d: %s\n", 
+                        curPostingID, e.what());
+                    continue;
+                }
+            } else {
+                processedData = p_postingListFullData + listInfo->pageOffset;
+            }
+           
+                // 4. 处理Posting List中的向量
+                try {
+                    extraSearcher->HelperProcessPosting(processedData, listInfo, workspace, queryResults, headIndex);
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Failed to process posting list %d: %s\n", 
+                        curPostingID, e.what());
+                    continue;
+                }
+            }
+         if (stats) {
+                stats->m_totalListElementsCount = listElements;
+                stats->m_diskIOCount = diskIO;
+                stats->m_diskAccessCount = diskRead;
+            }
+           
+        }
+
         template <typename T>
         ErrorCode Index<T>::SetParameter(const char* p_param, const char* p_value, const char* p_section)
         {
@@ -1000,6 +1245,30 @@ namespace SPTAG
             }
             else {
                 m_options.SetParameter(p_section, p_param, p_value);
+                
+                // 如果是缓冲池相关参数，动态调整缓冲池
+                if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "EnableBufferPool")) {
+                    bool enable;
+                    if (Helper::Convert::ConvertStringTo<bool>(p_value, enable)) {
+                        if (enable && !m_enableBufferPool && m_options.m_bufferPoolSize > 0) {
+                            InitBufferPool(m_options.m_bufferPoolSize);
+                        } else if (!enable && m_enableBufferPool) {
+                            m_bufferPool.reset();
+                            m_enableBufferPool = false;
+                            LOG(Helper::LogLevel::LL_Info, "Buffer pool disabled\n");
+                        }
+                    }
+                }
+                else if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "BufferPoolSize")) {
+                    size_t newSize;
+                    if (Helper::Convert::ConvertStringTo<size_t>(p_value, newSize)) {
+                        m_options.m_bufferPoolSize = newSize; 
+                        if (m_enableBufferPool && newSize != m_options.m_bufferPoolSize) {
+                            // 重新初始化缓冲池
+                            InitBufferPool(newSize);
+                        }
+                    }
+                }
             }
             if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "DistCalcMethod")) {
                 if (m_pQuantizer)
@@ -1094,7 +1363,7 @@ namespace SPTAG
 
             return m_extraSearcher->AddIndex(vectorSet, m_index, begin);
         }
-
+     
         template <typename T>
         ErrorCode Index<T>::DeleteIndex(const SizeType &p_id)
         {
@@ -1126,6 +1395,151 @@ namespace SPTAG
 
             return DeleteIndex(p_id);
         }
+// 
+       template <typename T>
+       Index<T>::~Index()
+        {
+            // 这可以确保在开始清理资源前，所有计算和日志输出都已完成
+            LOG(Helper::LogLevel::LL_Info, "Waiting 5 seconds before starting resource cleanup...\n");
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            // 防止重复析构
+            bool expected = false;
+            if (!m_destructorCalled.compare_exchange_strong(expected, true)) {
+                LOG(Helper::LogLevel::LL_Warning, "Index destructor already called, skipping...\n");
+                return;
+            }
+            
+            LOG(Helper::LogLevel::LL_Info, "Index destructor starting...\n");
+            
+            try {
+                // 1. 立即设置对象为不可用状态
+                m_bReady = false;
+                
+                // 2. 停止所有 OpenMP 线程
+                try {
+                    omp_set_num_threads(1);
+                } catch (...) {
+                    // 忽略 OpenMP 错误
+                }
+                
+                // 3. 等待所有操作完成
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                
+                // 4. 安全地清理 thread_local 工作空间
+                try {
+                    ClearWorkspace();
+                    LOG(Helper::LogLevel::LL_Info, "Thread-local workspace cleared.\n");
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Error clearing workspace: %s\n", e.what());
+                } catch (...) {
+                    LOG(Helper::LogLevel::LL_Error, "Unknown error clearing workspace\n");
+                }
+                
+                // 5. 清理 extra searcher
+                try {
+                    if (m_extraSearcher && m_extraSearcher.get() != nullptr) {
+                        LOG(Helper::LogLevel::LL_Info, "Resetting extra searcher...\n");
+                        m_extraSearcher.reset();
+                        LOG(Helper::LogLevel::LL_Info, "Extra searcher reset.\n");
+                    }
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Error resetting extra searcher: %s\n", e.what());
+                } catch (...) {
+                    LOG(Helper::LogLevel::LL_Error, "Unknown error resetting extra searcher\n");
+                }
+                
+                // 6. 清理头索引
+                try {
+                    if (m_index && m_index.get() != nullptr) {
+                        LOG(Helper::LogLevel::LL_Info, "Resetting head index...\n");
+                        m_index.reset();
+                        LOG(Helper::LogLevel::LL_Info, "Head index reset.\n");
+                    }
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Error resetting head index: %s\n", e.what());
+                } catch (...) {
+                    LOG(Helper::LogLevel::LL_Error, "Unknown error resetting head index\n");
+                }
+                
+                // 7. 清理其他成员
+                try {
+                    if (m_vectorTranslateMap && m_vectorTranslateMap.get() != nullptr) {
+                        LOG(Helper::LogLevel::LL_Info, "Clearing vector translate map...\n");
+                        m_vectorTranslateMap.reset();
+                        LOG(Helper::LogLevel::LL_Info, "Vector translate map cleared.\n");
+                    }
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Error clearing vector translate map: %s\n", e.what());
+                } catch (...) {
+                    LOG(Helper::LogLevel::LL_Error, "Unknown error clearing vector translate map\n");
+                }
+                
+                // 8. 清理量化器
+                try {
+                    if (m_pQuantizer && m_pQuantizer.get() != nullptr) {
+                        LOG(Helper::LogLevel::LL_Info, "Clearing quantizer...\n");
+                        m_pQuantizer.reset();
+                        LOG(Helper::LogLevel::LL_Info, "Quantizer cleared.\n");
+                    }
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Error clearing quantizer: %s\n", e.what());
+                } catch (...) {
+                    LOG(Helper::LogLevel::LL_Error, "Unknown error clearing quantizer\n");
+                }
+                
+                // 9. 清理元数据
+                try {
+                    if (m_pMetadata && m_pMetadata.get() != nullptr) {
+                        LOG(Helper::LogLevel::LL_Info, "Clearing metadata...\n");
+                        m_pMetadata.reset();
+                        LOG(Helper::LogLevel::LL_Info, "Metadata cleared.\n");
+                    }
+                } catch (const std::exception& e) {
+                    LOG(Helper::LogLevel::LL_Error, "Error clearing metadata: %s\n", e.what());
+                } catch (...) {
+                    LOG(Helper::LogLevel::LL_Error, "Unknown error clearing metadata\n");
+                }
+                
+                // 10. 最后等待
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                
+                LOG(Helper::LogLevel::LL_Info, "Index destructor complete.\n");
+                
+            } catch (const std::exception& e) {
+                LOG(Helper::LogLevel::LL_Error, "Error in Index destructor: %s\n", e.what());
+            } catch (...) {
+                LOG(Helper::LogLevel::LL_Error, "Unknown error in Index destructor\n");
+            }
+        }
+        void GlobalThreadLocalCleanup() {
+        try {
+            // 清理所有类型的 thread_local 工作空间
+            Index<float>::ClearWorkspace();
+            Index<double>::ClearWorkspace();
+            Index<std::int8_t>::ClearWorkspace();
+            Index<std::uint8_t>::ClearWorkspace();
+            Index<std::int16_t>::ClearWorkspace();
+            Index<std::uint16_t>::ClearWorkspace();
+            Index<std::int32_t>::ClearWorkspace();
+            Index<std::uint32_t>::ClearWorkspace();
+            Index<std::int64_t>::ClearWorkspace();
+            Index<std::uint64_t>::ClearWorkspace();
+            
+            // 设置 OpenMP 线程数为 1
+            omp_set_num_threads(1);
+            
+            // 等待清理完成
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            
+        } catch (...) {
+            // 忽略所有清理错误
+        }
+        }
+        // static bool global_cleanup_registered = []() {
+        // std::atexit(GlobalThreadLocalCleanup);
+        // return true;
+        // }();
     }
 }
 
@@ -1134,5 +1548,3 @@ template class SPTAG::SPANN::Index<Type>; \
 
 #include "inc/Core/DefinitionList.h"
 #undef DefineVectorValueType
-
-
